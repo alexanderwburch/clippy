@@ -98,11 +98,13 @@ class ClipboardStore: ObservableObject {
     }
     
     private func save() {
-        DispatchQueue.global(qos: .background).async { [weak self] in
-            guard let self = self else { return }
+        // Snapshot items on the main thread to avoid data race
+        let snapshot = items
+        let url = saveURL
+        DispatchQueue.global(qos: .background).async {
             do {
-                let data = try JSONEncoder().encode(self.items)
-                try data.write(to: self.saveURL, options: .atomic)
+                let data = try JSONEncoder().encode(snapshot)
+                try data.write(to: url, options: .atomic)
             } catch {
                 print("Failed to save clipboard history: \(error)")
             }

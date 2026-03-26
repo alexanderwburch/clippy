@@ -12,7 +12,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var previousApp: NSRunningApplication?
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    
+    private var tapHealthTimer: Timer?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Set up menu bar item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -84,6 +85,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+
+        // Monitor event tap health — macOS can disable it after sleep/wake or permission changes
+        tapHealthTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.checkEventTapHealth()
+        }
+    }
+
+    private func checkEventTapHealth() {
+        guard let tap = eventTap else {
+            // Tap was never created or was torn down — try to recreate
+            setupGlobalHotkey()
+            return
+        }
+
+        if !CGEvent.tapIsEnabled(tap: tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
     }
     
     @objc func showHistory() {
