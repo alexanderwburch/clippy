@@ -7,6 +7,8 @@ class ClipboardStore: ObservableObject {
     @Published private(set) var items: [ClipboardItem] = []
     
     private let maxItems = 5000
+    /// Drop clipboard entries older than this many days to avoid unbounded growth on disk.
+    private let retentionDays = 14
     private let saveURL: URL
     
     private init() {
@@ -42,10 +44,16 @@ class ClipboardStore: ObservableObject {
         }
         items.insert(newItem, at: 0)
         
+        trimExpired()
         // Trim to max size, but keep starred items
         trimToMaxSize()
         
         save()
+    }
+    
+    private func trimExpired() {
+        guard let cutoff = Calendar.current.date(byAdding: .day, value: -retentionDays, to: Date()) else { return }
+        items.removeAll { $0.timestamp < cutoff }
     }
     
     private func trimToMaxSize() {
@@ -82,21 +90,6 @@ class ClipboardStore: ObservableObject {
         save()
     }
     
-    func search(_ query: String) -> [ClipboardItem] {
-        guard !query.isEmpty else { return items }
-        
-        let lowercased = query.lowercased()
-        return items.filter { item in
-            if let text = item.text?.lowercased() {
-                return text.contains(lowercased)
-            }
-            if let appName = item.appName?.lowercased() {
-                return appName.contains(lowercased)
-            }
-            return false
-        }
-    }
-    
     private func save() {
         // Snapshot items on the main thread to avoid data race
         let snapshot = items
@@ -117,6 +110,11 @@ class ClipboardStore: ObservableObject {
             items = try JSONDecoder().decode([ClipboardItem].self, from: data)
         } catch {
             items = []
+        }
+        let countBefore = items.count
+        trimExpired()
+        if items.count != countBefore {
+            save()
         }
     }
 }
