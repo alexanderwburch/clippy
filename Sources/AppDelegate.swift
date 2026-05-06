@@ -39,12 +39,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Set up global Cmd+M hotkey using CGEvent tap
         setupGlobalHotkey()
-        
+
+        // Recreate the tap on wake — after sleep, re-enabling alone is sometimes insufficient
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+
         // Hide dock icon - we're a menu bar app
         NSApp.setActivationPolicy(.accessory)
     }
-    
+
+    @objc private func systemDidWake() {
+        tearDownEventTap()
+        setupGlobalHotkey()
+    }
+
+    private func tearDownEventTap() {
+        tapHealthTimer?.invalidate()
+        tapHealthTimer = nil
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+        }
+        runLoopSource = nil
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+        eventTap = nil
+    }
+
     private func setupGlobalHotkey() {
+        // Tear down any existing tap first so we don't leak run-loop sources on recreate
+        if eventTap != nil { tearDownEventTap() }
+
         // Create event tap to intercept Cmd+M globally
         let eventMask = (1 << CGEventType.keyDown.rawValue)
         
@@ -59,7 +88,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
                 guard let refcon = refcon else { return Unmanaged.passRetained(event) }
                 let appDelegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
-                
+
+                // macOS disables the tap on timeout or user input; re-enable so the hotkey doesn't go dead
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    if let tap = appDelegate.eventTap {
+                        CGEvent.tapEnable(tap: tap, enable: true)
+                    }
+                    return Unmanaged.passRetained(event)
+                }
+
                 // Check for Cmd+M (keycode 46 = M)
                 let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
                 let flags = event.flags
