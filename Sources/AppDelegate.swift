@@ -40,6 +40,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Set up global Cmd+M hotkey using CGEvent tap
         setupGlobalHotkey()
 
+        // Health timer runs for the lifetime of the app so we can self-heal if Accessibility
+        // permission is granted after launch (initial tapCreate fails silently in that case)
+        tapHealthTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.checkEventTapHealth()
+        }
+
         // Recreate the tap on wake — after sleep, re-enabling alone is sometimes insufficient
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
@@ -58,8 +64,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func tearDownEventTap() {
-        tapHealthTimer?.invalidate()
-        tapHealthTimer = nil
         if let source = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
         }
@@ -122,11 +126,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-
-        // Monitor event tap health — macOS can disable it after sleep/wake or permission changes
-        tapHealthTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.checkEventTapHealth()
-        }
     }
 
     private func checkEventTapHealth() {
