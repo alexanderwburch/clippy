@@ -10,7 +10,17 @@ class ClipboardStore: ObservableObject {
     /// Drop clipboard entries older than this many days to avoid unbounded growth on disk.
     private let retentionDays = 14
     private let saveURL: URL
-    
+
+    /// Serial queue so history writes never overlap on the same file.
+    private let saveQueue = DispatchQueue(label: "com.clippy.ClipboardStore.save", qos: .utility)
+    /// Pending coalesced write. Only ever touched on the main thread.
+    private var pendingSave: DispatchWorkItem?
+    /// Collapse a burst of mutations into a single write, at most once per this interval.
+    /// The whole history file (tens of MB with inline images) is rewritten on every save,
+    /// so writing on every clipboard change drove sustained disk writes past the system
+    /// limit and got the app terminated. Coalescing keeps the write rate bounded.
+    private let saveThrottleInterval: TimeInterval = 2.0
+
     private init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let clippyDir = appSupport.appendingPathComponent("Clippy", isDirectory: true)
@@ -91,16 +101,42 @@ class ClipboardStore: ObservableObject {
     }
     
     private func save() {
-        // Snapshot items on the main thread to avoid data race
+        // Coalesce rapid successive mutations into a single write. If a write is already
+        // scheduled it will capture the latest state when it fires, so we don't stack another.
+        guard pendingSave == nil else { return }
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.pendingSave = nil
+            // Snapshot on the main thread so we never read `items` while it's being mutated.
+            let snapshot = self.items
+            let url = self.saveURL
+            self.saveQueue.async {
+                self.writeToDisk(snapshot, to: url)
+            }
+        }
+        pendingSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + saveThrottleInterval, execute: work)
+    }
+
+    /// Persist any pending changes immediately. Call on quit so a coalesced save isn't lost.
+    func flush() {
+        pendingSave?.cancel()
+        pendingSave = nil
         let snapshot = items
         let url = saveURL
-        DispatchQueue.global(qos: .background).async {
-            do {
-                let data = try JSONEncoder().encode(snapshot)
-                try data.write(to: url, options: .atomic)
-            } catch {
-                print("Failed to save clipboard history: \(error)")
-            }
+        saveQueue.sync {
+            writeToDisk(snapshot, to: url)
+        }
+    }
+
+    /// Runs only on `saveQueue`, so writes to the history file never overlap.
+    private func writeToDisk(_ snapshot: [ClipboardItem], to url: URL) {
+        do {
+            let data = try JSONEncoder().encode(snapshot)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            print("Failed to save clipboard history: \(error)")
         }
     }
     

@@ -58,6 +58,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // Flush any coalesced clipboard save so the last changes aren't lost on quit.
+        ClipboardStore.shared.flush()
+    }
+
     @objc private func systemDidWake() {
         tearDownEventTap()
         setupGlobalHotkey()
