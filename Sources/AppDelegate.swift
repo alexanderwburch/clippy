@@ -10,9 +10,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var keyMonitor: Any?
     private let viewModel = HistoryViewModel.shared
     private var previousApp: NSRunningApplication?
-    private var eventTap: CFMachPort?
-    private var runLoopSource: CFRunLoopSource?
-    private var tapHealthTimer: Timer?
+    /// Ensures the Accessibility prompt is shown at most once per launch.
+    private var hasPromptedForAccessibility = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Set up menu bar item
@@ -37,22 +36,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initialize shell history monitor
         _ = ShellHistoryMonitor.shared
         
-        // Set up global Cmd+M hotkey using CGEvent tap
+        // Global hotkey via Carbon RegisterEventHotKey (through KeyboardShortcuts).
+        //
+        // This deliberately replaces the old CGEvent tap. A tap requires Accessibility
+        // trust, and Clippy is ad-hoc signed, so every rebuild changes the CDHash and
+        // silently invalidates the grant — the app kept running and capturing while ⌘M
+        // went dead, which is indistinguishable from a crash. Carbon hotkeys need no
+        // TCC permission at all, survive rebuilds and sleep/wake, and can't be disabled
+        // by the system the way a tap can. That removes the tap, its 5s health timer,
+        // and the wake-recreate dance along with the whole class of bugs they existed
+        // to paper over.
         setupGlobalHotkey()
-
-        // Health timer runs for the lifetime of the app so we can self-heal if Accessibility
-        // permission is granted after launch (initial tapCreate fails silently in that case)
-        tapHealthTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.checkEventTapHealth()
-        }
-
-        // Recreate the tap on wake — after sleep, re-enabling alone is sometimes insufficient
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self,
-            selector: #selector(systemDidWake),
-            name: NSWorkspace.didWakeNotification,
-            object: nil
-        )
 
         // Hide dock icon - we're a menu bar app
         NSApp.setActivationPolicy(.accessory)
@@ -63,88 +57,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ClipboardStore.shared.flush()
     }
 
-    @objc private func systemDidWake() {
-        tearDownEventTap()
-        setupGlobalHotkey()
-    }
-
-    private func tearDownEventTap() {
-        if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
-        }
-        runLoopSource = nil
-        if let tap = eventTap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-        }
-        eventTap = nil
-    }
-
     private func setupGlobalHotkey() {
-        // Tear down any existing tap first so we don't leak run-loop sources on recreate
-        if eventTap != nil { tearDownEventTap() }
-
-        // Create event tap to intercept Cmd+M globally
-        let eventMask = (1 << CGEventType.keyDown.rawValue)
-        
-        // Store self in a pointer for the callback
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        
-        guard let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: CGEventMask(eventMask),
-            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
-                guard let refcon = refcon else { return Unmanaged.passRetained(event) }
-                let appDelegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
-
-                // macOS disables the tap on timeout or user input; re-enable so the hotkey doesn't go dead
-                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                    if let tap = appDelegate.eventTap {
-                        CGEvent.tapEnable(tap: tap, enable: true)
-                    }
-                    return Unmanaged.passRetained(event)
-                }
-
-                // Check for Cmd+M (keycode 46 = M)
-                let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-                let flags = event.flags
-                
-                if keyCode == 46 && flags.contains(.maskCommand) && !flags.contains(.maskShift) && !flags.contains(.maskControl) && !flags.contains(.maskAlternate) {
-                    // Cmd+M pressed - trigger show history on main thread
-                    DispatchQueue.main.async {
-                        appDelegate.showHistory()
-                    }
-                    // Return nil to consume the event (prevent minimize)
-                    return nil
-                }
-                
-                return Unmanaged.passRetained(event)
-            },
-            userInfo: selfPtr
-        ) else {
-            print("Failed to create event tap. Make sure Clippy has Accessibility permissions.")
-            return
-        }
-        
-        eventTap = tap
-        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
-    }
-
-    private func checkEventTapHealth() {
-        guard let tap = eventTap else {
-            // Tap was never created or was torn down — try to recreate
-            setupGlobalHotkey()
-            return
+        // The Settings window has always shown a KeyboardShortcuts.Recorder bound to
+        // .showClipboardHistory, but nothing ever registered a handler for it — the
+        // recorder was dead UI and the real hotkey was the CGEvent tap. Register the
+        // handler so the recorder works, and seed ⌘M as the default the first time.
+        if KeyboardShortcuts.getShortcut(for: .showClipboardHistory) == nil {
+            KeyboardShortcuts.setShortcut(.init(.m, modifiers: [.command]), for: .showClipboardHistory)
         }
 
-        if !CGEvent.tapIsEnabled(tap: tap) {
-            CGEvent.tapEnable(tap: tap, enable: true)
+        KeyboardShortcuts.onKeyDown(for: .showClipboardHistory) { [weak self] in
+            self?.showHistory()
         }
     }
-    
+
+    /// Shows the system Accessibility prompt and points the user at the settings pane.
+    /// Only auto-paste needs this now — the hotkey itself no longer does.
+    private func promptForAccessibilityOnce() {
+        guard !hasPromptedForAccessibility else { return }
+        hasPromptedForAccessibility = true
+
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+        if AXIsProcessTrustedWithOptions(options as CFDictionary) { return }
+
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Clippy can't paste automatically"
+            alert.informativeText = """
+                Your clipboard history still works — the item you picked has been copied, \
+                so you can press ⌘V yourself.
+
+                To have Clippy paste for you, enable it in Privacy & Security → \
+                Accessibility. If Clippy is already listed, remove it with the “−” button \
+                and add it again — a rebuilt copy won't be trusted by the old entry.
+                """
+            alert.addButton(withTitle: "Open Settings")
+            alert.addButton(withTitle: "Later")
+            if alert.runModal() == .alertFirstButtonReturn,
+               let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+    }
+
     @objc func showHistory() {
         // Remember which app was active before we show
         previousApp = NSWorkspace.shared.frontmostApplication
@@ -255,7 +210,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else if let text = item.text {
             pasteboard.setString(text, forType: .string)
         }
-        
+
+        // Claim this write before the 50ms poller can see it. Otherwise the poller treats
+        // the entry we just staged as a new external copy, re-runs the quote-strip, and
+        // rewrites the pasteboard out from under the synthetic ⌘V posted below.
+        ClipboardManager.shared.registerSelfWrite()
+
         // Store the previous app before dismissing
         let appToActivate = previousApp
         
@@ -269,13 +229,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             
             // Wait a bit for the app to become active, then paste
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                // Posting synthetic key events still requires Accessibility (opening the
+                // window no longer does). Without it the post is silently swallowed, so
+                // say so once rather than looking broken — the item is already on the
+                // clipboard either way, so ⌘V by hand works.
+                guard AXIsProcessTrusted() else {
+                    self.promptForAccessibilityOnce()
+                    return
+                }
+
                 let source = CGEventSource(stateID: .hidSystemState)
-                
+
                 // Key code 9 = V key
                 let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
                 keyDown?.flags = .maskCommand
                 keyDown?.post(tap: .cghidEventTap)
-                
+
                 let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
                 keyUp?.flags = .maskCommand
                 keyUp?.post(tap: .cghidEventTap)

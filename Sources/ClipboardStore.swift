@@ -9,6 +9,10 @@ class ClipboardStore: ObservableObject {
     private let maxItems = 5000
     /// Drop clipboard entries older than this many days to avoid unbounded growth on disk.
     private let retentionDays = 14
+    /// Total budget for stored image bytes. The whole history is rewritten to disk on
+    /// every change, so unbounded image accumulation drives disk writes past the system
+    /// limit and gets the app terminated. Oldest non-starred images are evicted first.
+    private let maxImageBytes = 12 * 1024 * 1024
     private let saveURL: URL
 
     /// Serial queue so history writes never overlap on the same file.
@@ -57,7 +61,8 @@ class ClipboardStore: ObservableObject {
         trimExpired()
         // Trim to max size, but keep starred items
         trimToMaxSize()
-        
+        trimImageBudget()
+
         save()
     }
     
@@ -83,6 +88,25 @@ class ClipboardStore: ObservableObject {
         }
     }
     
+    /// Evict oldest non-starred images once total image bytes exceed the budget,
+    /// keeping the on-disk history (and the memory footprint) bounded.
+    private func trimImageBudget() {
+        var runningTotal = 0
+        var overBudget = false
+        // items[0] is newest; walk newest→oldest so the oldest images drop first.
+        items = items.filter { item in
+            guard let data = item.imageData else { return true }
+            if item.isStarred { return true }
+            if overBudget { return false }
+            runningTotal += data.count
+            if runningTotal > maxImageBytes {
+                overBudget = true
+                return false
+            }
+            return true
+        }
+    }
+
     func toggleStar(_ item: ClipboardItem) {
         if let index = items.firstIndex(where: { $0.id == item.id }) {
             items[index].isStarred.toggle()
